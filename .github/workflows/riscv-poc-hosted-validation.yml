@@ -1,0 +1,101 @@
+# Phase 1.5 hosted validation workflow for the RISC-V Compiler Research Workbench.
+#
+# Purpose: prove that the Phase 1 PoC (benchmarks/poc-matmul) compiles with BOTH
+# GCC and Clang for rv64gc, executes under qemu-riscv64 user-mode, passes the
+# documented checksum correctness check, and captures genuine timings on a real
+# free-tier hosted Linux runner.
+#
+# Constraints honored:
+#   - Manual trigger only (workflow_dispatch); bounded runtime (20 min cap).
+#   - No secrets. No RVV performance experiments. No arbitrary user input.
+#   - Reuses the existing PoC script unchanged (same flags/targets as local run).
+#   - Asserts the checksum documented in docs/PHASE1_FEASIBILITY_REPORT.md
+#     sections 4/9: 0x326165c972aaa79d (derived from fixed-seed benchmark).
+#   - Fails clearly on compile, execution, or correctness errors.
+#   - Uploads raw logs/results as artifacts for independent inspection.
+#
+# This workflow validates a CI execution path. It does NOT prove a continuously
+# available worker service (no persistence, no queue claiming, ephemeral FS).
+
+name: riscv-poc-hosted-validation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  poc-matmul-rv64gc:
+    name: poc-matmul GCC+Clang rv64gc on qemu-riscv64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Record OS environment
+        run: |
+          set -euo pipefail
+          head -4 /etc/os-release
+          echo "---"
+          echo "CPUs: $(nproc)"
+          free -h | head -2
+          df -h / | tail -1
+
+      - name: Install toolchains and QEMU (documented package names only)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-riscv64-linux-gnu clang qemu-user file
+
+      - name: Record installed tool versions
+        run: |
+          set -euo pipefail
+          echo "GCC_CROSS=$(riscv64-linux-gnu-gcc --version | head -1)"
+          echo "CLANG=$(clang --version | head -1)"
+          echo "QEMU=$(qemu-riscv64 --version | head -1)"
+          echo "GCC_NATIVE=$(gcc --version | head -1)"
+
+      - name: Run existing Phase 1 PoC sequence (run_poc.sh, unchanged)
+        run: |
+          set -euo pipefail
+          bash benchmarks/poc-matmul/run_poc.sh 2>&1 | tee poc_run.log
+
+      - name: Assert documented expected checksum on every output
+        run: |
+          set -euo pipefail
+          EXPECTED="0x326165c972aaa79d"
+          for f in /tmp/riscv-poc/ref_out.txt /tmp/riscv-poc/gcc_out.txt /tmp/riscv-poc/clang_out.txt; do
+            ck=$(sed -n 's/^CHECKSUM=//p' "$f" | head -1)
+            if [ "$ck" != "$EXPECTED" ]; then
+              echo "FAIL: $f produced checksum '$ck', expected $EXPECTED"
+              exit 1
+            fi
+            echo "OK: $f checksum $ck"
+          done
+          echo "HOSTED CHECKSUM ASSERTION: PASS"
+
+      - name: Collect raw results, timings, and environment metadata
+        if: always()
+        run: |
+          mkdir -p results
+          cp poc_run.log results/ 2>/dev/null || true
+          cp /tmp/riscv-poc/ref_out.txt /tmp/riscv-poc/gcc_out.txt \
+             /tmp/riscv-poc/clang_out.txt /tmp/riscv-poc/gcc_run.log \
+             /tmp/riscv-poc/clang_run.log results/ 2>/dev/null || true
+          {
+            echo "HOSTED_RUN_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "RUNNER_OS=$(grep PRETTY_NAME /etc/os-release | cut -d= -f2)"
+            echo "GCC_CROSS=$(riscv64-linux-gnu-gcc --version | head -1)"
+            echo "CLANG=$(clang --version | head -1)"
+            echo "QEMU=$(qemu-riscv64 --version | head -1)"
+          } >> results/hosted_env.txt
+          cat results/hosted_env.txt
+
+      - name: Upload logs and raw results as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: riscv-poc-hosted-results
+          path: |
+            results/
+            poc_run.log
+          retention-days: 30
